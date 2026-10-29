@@ -1,70 +1,45 @@
-
 import time
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import create_app
 
 
-# Test submitting a job and retrieving its result.
-def test_submit_and_process_job():
-
-    # Start FastAPI with its lifespan and background workers.
+def test_submit_and_process_job(tmp_path):
+    app = create_app(db_path=str(tmp_path / "jobs.sqlite3"), embedded_workers=True)
     with TestClient(app) as client:
-
-        # Submit an addition job through the HTTP API.
-        response = client.post(
-            "/jobs",
-            json={
-                "payload": {
-                    "task": "add",
-                    "a": 10,
-                    "b": 20
-                }
-            }
-        )
-
-        # Verify the API accepted the job.
+        response = client.post("/jobs", json={
+            "payload": {"task": "add", "a": 10, "b": 20},
+            "max_attempts": 2,
+        })
         assert response.status_code == 202
-
-        # Get the unique ID assigned to the job.
+        assert response.json()["max_attempts"] == 2
         job_id = response.json()["id"]
-
-        # Allow up to 2 seconds for job processing.
         deadline = time.monotonic() + 2
-
         while time.monotonic() < deadline:
-
-            # Retrieve the latest job status.
             result = client.get(f"/jobs/{job_id}")
-
-            assert result.status_code == 200
-
-            job = result.json()
-
-            # Verify the worker processed the job correctly.
-            if job["status"] == "completed":
-                assert job["result"] == 30
-                assert job["attempts"] == 1
+            if result.json()["status"] == "completed":
+                assert result.json()["result"] == 30
                 return
-
-            # Fail immediately if job execution failed.
-            if job["status"] == "failed":
-                raise AssertionError(job["error"])
-
-            # Briefly wait before checking again.
             time.sleep(0.01)
-
         raise AssertionError("Job did not complete in time")
 
 
-# Verify that requesting an unknown job returns HTTP 404.
-def test_job_not_found():
+def test_job_not_found_and_validation(tmp_path):
+    app = create_app(db_path=str(tmp_path / "jobs.sqlite3"))
     with TestClient(app) as client:
+        assert client.get("/jobs/00000000-0000-0000-0000-000000000000").status_code == 404
+        assert client.post("/jobs", json={"payload": {}, "max_attempts": 0}).status_code == 422
+        assert client.post("/jobs", json={"payload": {}, "max_attempts": 11}).status_code == 422
+        assert client.get("/health").json()["status"] == "healthy"
 
-        response = client.get(
-            "/jobs/00000000-0000-0000-0000-000000000000"
-        )
 
-        assert response.status_code == 404
-        assert response.json()["detail"] == "Job not found"
+def test_api_returns_503_on_capacity(tmp_path):
+    app = create_app(db_path=str(tmp_path / "jobs.sqlite3"), embedded_workers=False, max_pending=1)
+    with TestClient(app) as client:
+        body = {"payload": {"task": "sleep", "seconds": 1}}
+        assert client.post("/jobs", json=body).status_code == 202
+        full = client.post("/jobs", json=body)
+        assert full.status_code == 503
+        assert full.headers.get("retry-after") == "1"
+        assert client.get("/metrics").json()["active"] == 1

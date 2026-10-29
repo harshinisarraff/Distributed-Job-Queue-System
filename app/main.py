@@ -1,5 +1,6 @@
-
+"""HTTP API for job submission, status lookup, and queue metrics."""
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from uuid import UUID
 
@@ -7,106 +8,93 @@ from fastapi import FastAPI, HTTPException, Request
 
 from app.models import Job, JobRequest
 from app.queue import JobQueue
+from app.store import QueueFull
 from app.worker import Worker
 
 
-# Manage what happens when the API starts and stops.
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def create_app(db_path: str | None = None, embedded_workers: bool | None = None,
+               max_pending: int | None = None) -> FastAPI:
+    """App factory supports isolated tests and separate API/worker containers."""
+    if db_path is None:
+        db_path = os.getenv("DB_PATH", "data/jobs.sqlite3")
+    if max_pending is None:
+        max_pending = int(os.getenv("QUEUE_CAPACITY", "1000"))
+    if embedded_workers is None:
+        embedded_workers = os.getenv("EMBEDDED_WORKERS", "1") == "1"
 
-    # Create one shared queue with capacity for 1000 jobs.
-    queue = JobQueue(maxsize=1000)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        queue = JobQueue(db_path=db_path, maxsize=max_pending)
+        app.state.queue = queue
+        stop_event = asyncio.Event()
+        worker_tasks = []
+        if embedded_workers:
+            # Embedded workers are convenient for local development.
+            worker_tasks = [
+                asyncio.create_task(Worker(queue).run_forever(stop_event))
+                for _ in range(int(os.getenv("WORKER_COUNT", "2")))
+            ]
+        try:
+            yield
+        finally:
+            # Stop accepting HTTP requests before this lifespan cleanup runs.
+            # Give in-progress jobs limited time to finish before exiting.
+            if worker_tasks:
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while asyncio.get_running_loop().time() < deadline:
+                    if (await queue.stats())["active"] == 0:
+                        break
+                    await asyncio.sleep(0.05)
+                stop_event.set()
+                try:
+                    await asyncio.wait_for(asyncio.gather(*worker_tasks), timeout=2)
+                except TimeoutError:
+                    for task in worker_tasks:
+                        task.cancel()
+                    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-    # Store the queue so API endpoints can access it.
-    app.state.queue = queue
+    app = FastAPI(
+        title="Distributed Job Queue System",
+        description="Durable multi-process asynchronous job queue with retries and backpressure",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
 
-    # Create two workers that share the same queue.
-    workers = [
-        Worker(queue),
-        Worker(queue)
-    ]
+    @app.get("/")
+    async def root():
+        return {"message": "Distributed Job Queue API is running"}
 
-    # Start both workers as asynchronous background tasks.
-    worker_tasks = [
-        asyncio.create_task(worker.run_forever())
-        for worker in workers
-    ]
+    @app.get("/health")
+    async def health(request: Request):
+        # A database query verifies that the queue storage is reachable.
+        await request.app.state.queue.stats()
+        return {"status": "healthy", "service": "distributed-job-queue"}
 
-    try:
-        # Allow FastAPI to start accepting HTTP requests.
-        yield
+    @app.get("/metrics")
+    async def metrics(request: Request):
+        return await request.app.state.queue.stats()
 
-    finally:
-        # Wait for all submitted jobs to be acknowledged.
-        await queue.join()
+    @app.post("/jobs", response_model=Job, status_code=202)
+    async def submit_job(job_request: JobRequest, request: Request):
+        try:
+            return await request.app.state.queue.submit(
+                job_request.payload, max_attempts=job_request.max_attempts,
+                timeout=0.5,
+            )
+        except QueueFull as exc:
+            raise HTTPException(status_code=503, detail=str(exc),
+                                headers={"Retry-After": "1"}) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        # Stop workers after processing is finished.
-        for task in worker_tasks:
-            task.cancel()
+    @app.get("/jobs/{job_id}", response_model=Job)
+    async def get_job(job_id: UUID, request: Request):
+        job = await request.app.state.queue.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
 
-        # Wait until both worker tasks have exited.
-        await asyncio.gather(
-            *worker_tasks,
-            return_exceptions=True
-        )
-
-
-# Initialize FastAPI and attach the startup/shutdown logic.
-app = FastAPI(
-    title="Distributed Job Queue",
-    description="A high-throughput asynchronous job processing system",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-
-# Check whether the API is responding.
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "service": "distributed-job-queue"
-    }
-
-
-# Return a welcome message.
-@app.get("/")
-async def root():
-    return {
-        "message": "Distributed Job Queue API is running"
-    }
-
-
-# Accept a new job from a client.
-@app.post("/jobs", response_model=Job, status_code=202)
-async def submit_job(job_request: JobRequest, request: Request):
-
-    # Access the shared job queue.
-    queue: JobQueue = request.app.state.queue
-
-    # Create and enqueue a new job.
-    job = await queue.submit(job_request.payload)
-
-    # Return the job information to the client.
-    return job
+    return app
 
 
-# Retrieve a job by its unique ID.
-@app.get("/jobs/{job_id}", response_model=Job)
-async def get_job(job_id: UUID, request: Request):
-
-    # Access the shared queue.
-    queue: JobQueue = request.app.state.queue
-
-    # Look up the job using its ID.
-    job = queue.get_job(job_id)
-
-    # Return an HTTP 404 if the job doesn't exist.
-    if job is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found"
-        )
-
-    # Return its current status and result.
-    return job
+app = create_app()

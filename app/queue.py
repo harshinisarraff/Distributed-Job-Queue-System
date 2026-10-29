@@ -1,51 +1,48 @@
-
+"""Async facade around the SQLite broker, safe for FastAPI's event loop."""
 import asyncio
+import time
 from typing import Any
 from uuid import UUID
 
 from app.models import Job
+from app.store import JobStore, QueueFull
 
 
 class JobQueue:
-    # Initialize a queue with a maximum capacity.
-    def __init__(self, maxsize: int = 1000):
-        # Stores jobs waiting to be processed.
-        self._queue: asyncio.Queue[Job] = asyncio.Queue(
-            maxsize=maxsize
-        )
+    def __init__(self, db_path: str = "data/jobs.sqlite3", maxsize: int = 1000):
+        self.store = JobStore(db_path, max_pending=maxsize)
 
-        # Stores jobs by ID so their status can be retrieved.
-        self._jobs: dict[UUID, Job] = {}
+    async def submit(self, payload: dict[str, Any], max_attempts: int = 3,
+                     timeout: float = 0.5) -> Job:
+        # Return capacity to the caller rather than blocking HTTP indefinitely.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return await asyncio.to_thread(self.store.submit, payload, max_attempts)
+            except QueueFull:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(min(0.02, max(0, deadline - time.monotonic())))
 
-    # Create a new job and add it to the queue.
-    async def submit(self, payload: dict[str, Any]) -> Job:
-        job = Job(payload=payload)
+    async def claim(self, owner: str, lease_seconds: float = 30) -> Job | None:
+        return await asyncio.to_thread(self.store.claim, owner, lease_seconds)
 
-        # Wait for available space if the queue is full.
-        await self._queue.put(job)
+    async def complete(self, job_id: UUID, owner: str, result: Any) -> bool:
+        return await asyncio.to_thread(self.store.complete, str(job_id), owner, result)
 
-        # Save the job for future status lookups.
-        self._jobs[job.id] = job
+    async def fail(self, job_id: UUID, owner: str, error: str, retryable: bool,
+                   base_delay: float = 0.1, max_delay: float = 2.0) -> bool:
+        return await asyncio.to_thread(self.store.fail, str(job_id), owner, error,
+                                       retryable, base_delay, max_delay)
 
-        return job
+    async def get_job(self, job_id: UUID) -> Job | None:
+        return await asyncio.to_thread(self.store.get_job, str(job_id))
 
-    # Retrieve the next available job.
-    async def get(self) -> Job:
-        # Wait if no jobs are available.
-        return await self._queue.get()
+    async def stats(self) -> dict[str, int]:
+        return await asyncio.to_thread(self.store.stats)
 
-    # Notify the queue that a retrieved job is finished.
-    def task_done(self) -> None:
-        self._queue.task_done()
+    async def recover_expired(self) -> int:
+        return await asyncio.to_thread(self.store.recover_expired)
 
-    # Wait until all queued jobs have been acknowledged.
-    async def join(self) -> None:
-        await self._queue.join()
-
-    # Look up a job using its unique ID.
-    def get_job(self, job_id: UUID) -> Job | None:
-        return self._jobs.get(job_id)
-
-    # Return the number of jobs currently waiting.
-    def size(self) -> int:
-        return self._queue.qsize()
+    async def cleanup(self, older_than_seconds: float) -> int:
+        return await asyncio.to_thread(self.store.prune_completed, older_than_seconds)

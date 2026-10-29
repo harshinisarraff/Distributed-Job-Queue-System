@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /app/data/jobs.sqlite3
+      QUEUE_CAPACITY: "1000"
+      EMBEDDED_WORKERS: "0"
+    volumes:
+      - queue-data:/app/data
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m app.worker_service
+    environment:
+      DB_PATH: /app/data/jobs.sqlite3
+      QUEUE_CAPACITY: "1000"
+      WORKER_COUNT: "2"
+    volumes:
+      - queue-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  queue-data:
